@@ -26,7 +26,7 @@ Converts proxy subscriptions (URLs or files) into a configuration for sing-box (
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/sub2singbox.git
+git clone https://github.com/dmsh-public-contact/sub2singbox.git
 cd sub2singbox
 pip install -r requirements.txt
 ```
