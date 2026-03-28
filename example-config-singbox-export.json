@@ -1,0 +1,22 @@
+{
+    "quiet": true,
+    "cache-dir": "/tmp/sub2singbox",
+    "cache-ttl": 3600,
+    "ignore-cache": false,
+    "resolve-country": true,
+    "no-number-tags": true,
+    "tag-format": "{flag_in} {country_in}: {in_ip}:{in_port} ➜ {flag_out} {country_out}: {out_ip} | {speed_download}/{speed_upload} Mbps",
+    "exclude-country-in": "RU,UA,BY,KZ,CN,IR",
+    "exclude-country-out": "RU,UA,BY,KZ,CN,IR",
+    "test-connect": true,
+    "speedtest": true,
+    "min-download-speed": 1,
+    "min-upload-speed": 1,
+    "sing-box-path": "/usr/bin/sing-box",
+    "test-url": "https://www.gstatic.com/generate_204",
+    "test-threads": 100,
+    "test-timeout": 5,
+    "types": "vless,vmess,trojan,shadowsocks,hysteria,hysteria2",
+    "config": "../configs/config-referense.json",
+    "output": "../configs/config.json"
+}
