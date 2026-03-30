@@ -1561,7 +1561,7 @@ def test_with_singbox(proxy: Proxy, test_url: str,
 
         download_cmd = [
             curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-            '--max-time', str(speedtest_timeout), '--connect-timeout', str(5),
+            '--max-time', str(speedtest_timeout), '--connect-timeout', str(timeout),
             '--silent', '--output', '/dev/null', speedtest_download_url
         ]
         try:
@@ -1595,7 +1595,7 @@ def test_with_singbox(proxy: Proxy, test_url: str,
 
             upload_cmd = [
                 curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-                '--max-time', str(speedtest_timeout), '--connect-timeout', str(5),
+                '--max-time', str(speedtest_timeout), '--connect-timeout', str(timeout),
                 '--silent', '--output', '/dev/null', '--data-binary', f'@{data_file}',
                 speedtest_upload_url
             ]
@@ -2079,7 +2079,7 @@ def main():
     parser.add_argument('--test-connect', action='store_true', help='Enable connectivity test using sing-box for each outbound.')
     parser.add_argument('--test-url', default='http://cp.cloudflare.com', help='URL to use for testing with sing-box.')
     parser.add_argument('--sing-box-path', default='/usr/bin/sing-box', help='Path to sing-box executable.')
-    parser.add_argument('--test-timeout', type=float, default=0.2, help='Timeout in seconds for connectivity test.')
+    parser.add_argument('--test-timeout', type=float, default=5, help='Timeout in seconds for connectivity test.')
     parser.add_argument('--test-threads', type=int, default=10, help='Number of threads for connectivity test.')
     parser.add_argument('--speedtest', action='store_true', help='Enable download and upload speed measurement (requires --test-connect).')
     parser.add_argument('--speedtest-download-url', default='http://cachefly.cachefly.net/1mb.test', help='URL for download speed test (default: http://cachefly.cachefly.net/1mb.test).')
