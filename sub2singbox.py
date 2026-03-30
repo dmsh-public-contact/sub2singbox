@@ -154,10 +154,10 @@ import subprocess
 import os
 import signal
 import threading
-import requests
 import logging
 import atexit
 import shutil
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional, List, Set, Tuple, Union
 from collections import OrderedDict
@@ -231,30 +231,6 @@ def save_test_cache(cache_dir, cache):
     cache_file = os.path.join(cache_dir, "cache.json")
     with open(cache_file, 'w') as f:
         json.dump(cache, f, indent=2)
-
-# ----------------------------------------------------------------------
-# Rate limiter (kept for compatibility)
-# ----------------------------------------------------------------------
-class RateLimiter:
-    def __init__(self, max_calls: int, period: float):
-        self.max_calls = max_calls
-        self.period = period
-        self.calls = []
-        self.lock = threading.Lock()
-
-    def wait(self):
-        with self.lock:
-            now = time.time()
-            self.calls = [t for t in self.calls if now - t < self.period]
-            if len(self.calls) >= self.max_calls:
-                sleep_time = self.calls[0] + self.period - now
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                now = time.time()
-                self.calls = [t for t in self.calls if now - t < self.period]
-            self.calls.append(now)
-
-ip_api_limiter = RateLimiter(45, 60)  # not used
 
 # ----------------------------------------------------------------------
 # TTL cache with thread safety
@@ -393,8 +369,15 @@ def maybe_decode_base64(content: str, verbose: bool = False) -> str:
         pass
     return content
 
+def is_valid_ip(ip: str) -> bool:
+    try:
+        ipaddress.ip_address(ip.strip())
+        return True
+    except ValueError:
+        return False
+
 # ----------------------------------------------------------------------
-# Parser functions (each returns Proxy or None)
+# Parser functions (each returns Proxy or None) – полные реализации
 # ----------------------------------------------------------------------
 def parse_vless(uri: str, fragment: str,
                 allowed_transport: Optional[Set[str]] = None,
@@ -1180,15 +1163,18 @@ def process_subscription(source: str,
 # ----------------------------------------------------------------------
 port_lock = threading.Lock()
 active_processes = []
+processes_lock = threading.Lock()
 
 @atexit.register
 def cleanup_processes():
-    for proc in active_processes:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except:
-            proc.kill()
+    with processes_lock:
+        for proc in active_processes:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except:
+                proc.kill()
+        active_processes.clear()
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1227,6 +1213,35 @@ def resolve_domain_via_proxy(domain: str, proxy_port: int, timeout: float, curl_
             logger.warning(f"Exception during DoH resolution for {domain}: {e}")
     return None
 
+def get_external_ip_via_proxy(proxy_port: int, timeout: float, curl_path: str, verbose: bool = False) -> Optional[str]:
+    """Try multiple services to get external IP through proxy."""
+    services = [
+        'http://ifconfig.me/ip',
+        'http://icanhazip.com',
+        'http://checkip.amazonaws.com',
+        'http://ip-api.com/fields/query'
+    ]
+    for url in services:
+        try:
+            cmd = [curl_path, '--socks5-hostname', f'127.0.0.1:{proxy_port}',
+                   '--max-time', str(timeout), '--connect-timeout', str(timeout),
+                   '--silent', url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+2)
+            if result.returncode == 0:
+                ip = result.stdout.strip()
+                if ip and is_valid_ip(ip):
+                    if verbose:
+                        logger.debug(f"Got external IP {ip} from {url}")
+                    return ip
+        except Exception as e:
+            if verbose:
+                logger.debug(f"Failed to get IP from {url}: {e}")
+            continue
+    return None
+
+# ----------------------------------------------------------------------
+# Sing-box test with cache, latency, speedtest, DNS, and country (both via proxy)
+# ----------------------------------------------------------------------
 def test_with_singbox(proxy: Proxy, test_url: str,
                       timeout: float, singbox_path: str,
                       resolve_country: bool,
@@ -1274,7 +1289,8 @@ def test_with_singbox(proxy: Proxy, test_url: str,
         if verbose:
             logger.debug(f"Starting sing-box for outbound {proxy.tag} on port {inbound_port}")
         proc = subprocess.Popen(cmd_base + [config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        active_processes.append(proc)
+        with processes_lock:
+            active_processes.append(proc)
 
     # Wait for port ready
     ready = False
@@ -1292,8 +1308,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
     if not ready:
         if verbose:
             logger.warning(f"sing-box did not start within timeout")
+        with processes_lock:
+            if proc in active_processes:
+                active_processes.remove(proc)
         proc.terminate()
-        active_processes.remove(proc)
         try:
             os.unlink(config_path)
         except:
@@ -1327,8 +1345,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
 
     if not success:
         proxy.latency = latency
+        with processes_lock:
+            if proc in active_processes:
+                active_processes.remove(proc)
         proc.terminate()
-        active_processes.remove(proc)
         try:
             os.unlink(config_path)
         except:
@@ -1348,8 +1368,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
         else:
             if verbose:
                 logger.debug(f"Failed to resolve {proxy.original_host} via proxy")
+            with processes_lock:
+                if proc in active_processes:
+                    active_processes.remove(proc)
             proc.terminate()
-            active_processes.remove(proc)
             try:
                 os.unlink(config_path)
             except:
@@ -1364,11 +1386,11 @@ def test_with_singbox(proxy: Proxy, test_url: str,
         # IN country via iplocation.net through proxy
         curl_in_cmd = [
             curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-            '--max-time', str(timeout), '--connect-timeout', str(timeout),
+            '--max-time', '5', '--connect-timeout', '5',
             '--silent', f'https://api.iplocation.net/?ip={resolved_ip}'
         ]
         try:
-            in_result = subprocess.run(curl_in_cmd, capture_output=True, text=True, timeout=timeout+5)
+            in_result = subprocess.run(curl_in_cmd, capture_output=True, text=True, timeout=10)
             if in_result.returncode == 0:
                 data = json.loads(in_result.stdout)
                 if data.get('response_code') == '200':
@@ -1381,8 +1403,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                     else:
                         if verbose:
                             logger.debug(f"IN country lookup returned no country_code2 for {resolved_ip}")
+                        with processes_lock:
+                            if proc in active_processes:
+                                active_processes.remove(proc)
                         proc.terminate()
-                        active_processes.remove(proc)
                         try:
                             os.unlink(config_path)
                         except:
@@ -1391,8 +1415,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                 else:
                     if verbose:
                         logger.warning(f"IN country lookup failed for {resolved_ip}: {data.get('response_message', 'unknown error')}")
+                    with processes_lock:
+                        if proc in active_processes:
+                            active_processes.remove(proc)
                     proc.terminate()
-                    active_processes.remove(proc)
                     try:
                         os.unlink(config_path)
                     except:
@@ -1401,8 +1427,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
             else:
                 if verbose:
                     logger.warning(f"IN country lookup curl error, exit code {in_result.returncode}")
+                with processes_lock:
+                    if proc in active_processes:
+                        active_processes.remove(proc)
                 proc.terminate()
-                active_processes.remove(proc)
                 try:
                     os.unlink(config_path)
                 except:
@@ -1411,46 +1439,49 @@ def test_with_singbox(proxy: Proxy, test_url: str,
         except Exception as e:
             if verbose:
                 logger.warning(f"IN country lookup exception: {e}")
+            with processes_lock:
+                if proc in active_processes:
+                    active_processes.remove(proc)
             proc.terminate()
-            active_processes.remove(proc)
             try:
                 os.unlink(config_path)
             except:
                 pass
             return False
 
-        # OUT country: get external IP via ifconfig.me, then lookup via iplocation.net
-        curl_ip_cmd = [
-            curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-            '--max-time', str(timeout), '--connect-timeout', str(timeout),
-            '--silent', 'http://ifconfig.me/ip'
-        ]
-        try:
-            ip_result = subprocess.run(curl_ip_cmd, capture_output=True, text=True, timeout=timeout+5)
-            if ip_result.returncode == 0:
-                out_ip = ip_result.stdout.strip()
-                if out_ip and re.match(r'^(\d{1,3}\.){3}\d{1,3}$', out_ip):
-                    proxy.out_ip = out_ip
-                    # Now get country for this IP via iplocation.net
-                    curl_country_cmd = [
-                        curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-                        '--max-time', str(timeout), '--connect-timeout', str(timeout),
-                        '--silent', f'https://api.iplocation.net/?ip={out_ip}'
-                    ]
-                    country_result = subprocess.run(curl_country_cmd, capture_output=True, text=True, timeout=timeout+5)
+        # OUT country: get external IP (cached if possible)
+        out_ip = get_external_ip_via_proxy(inbound_port, 5, curl_path, verbose)
+        if out_ip:
+            proxy.out_ip = out_ip
+            cached_out_country = country_cache.get(out_ip)
+            if cached_out_country:
+                proxy.country_out = cached_out_country
+                if verbose:
+                    logger.debug(f"OUT country from cache: {cached_out_country} for {out_ip}")
+            else:
+                curl_country_cmd = [
+                    curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
+                    '--max-time', '5', '--connect-timeout', '5',
+                    '--silent', f'https://api.iplocation.net/?ip={out_ip}'
+                ]
+                try:
+                    country_result = subprocess.run(curl_country_cmd, capture_output=True, text=True, timeout=10)
                     if country_result.returncode == 0:
                         data = json.loads(country_result.stdout)
                         if data.get('response_code') == '200':
                             country_out = data.get('country_code2')
                             if country_out:
                                 proxy.country_out = country_out
+                                country_cache.set(out_ip, country_out)
                                 if verbose:
                                     logger.debug(f"Outgoing country: {country_out} IP: {out_ip}")
                             else:
                                 if verbose:
                                     logger.debug(f"OUT country lookup returned no country_code2 for {out_ip}")
+                                with processes_lock:
+                                    if proc in active_processes:
+                                        active_processes.remove(proc)
                                 proc.terminate()
-                                active_processes.remove(proc)
                                 try:
                                     os.unlink(config_path)
                                 except:
@@ -1459,8 +1490,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                         else:
                             if verbose:
                                 logger.warning(f"OUT country lookup failed for {out_ip}: {data.get('response_message', 'unknown error')}")
+                            with processes_lock:
+                                if proc in active_processes:
+                                    active_processes.remove(proc)
                             proc.terminate()
-                            active_processes.remove(proc)
                             try:
                                 os.unlink(config_path)
                             except:
@@ -1469,38 +1502,34 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                     else:
                         if verbose:
                             logger.warning(f"OUT country lookup curl error, exit code {country_result.returncode}")
+                        with processes_lock:
+                            if proc in active_processes:
+                                active_processes.remove(proc)
                         proc.terminate()
-                        active_processes.remove(proc)
                         try:
                             os.unlink(config_path)
                         except:
                             pass
                         return False
-                else:
+                except Exception as e:
                     if verbose:
-                        logger.debug(f"Invalid external IP received: {out_ip}")
+                        logger.warning(f"OUT country lookup exception: {e}")
+                    with processes_lock:
+                        if proc in active_processes:
+                            active_processes.remove(proc)
                     proc.terminate()
-                    active_processes.remove(proc)
                     try:
                         os.unlink(config_path)
                     except:
                         pass
                     return False
-            else:
-                if verbose:
-                    logger.warning(f"External IP lookup curl error, exit code {ip_result.returncode}")
-                proc.terminate()
-                active_processes.remove(proc)
-                try:
-                    os.unlink(config_path)
-                except:
-                    pass
-                return False
-        except Exception as e:
+        else:
             if verbose:
-                logger.exception(f"External IP lookup exception: {e}")
+                logger.debug(f"Failed to get external IP via proxy")
+            with processes_lock:
+                if proc in active_processes:
+                    active_processes.remove(proc)
             proc.terminate()
-            active_processes.remove(proc)
             try:
                 os.unlink(config_path)
             except:
@@ -1526,13 +1555,13 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                     logger.warning(f"Failed to get file size: {e}")
             return None
 
-        file_size = get_file_size(speedtest_download_url, inbound_port, timeout, curl_path, verbose)
+        file_size = get_file_size(speedtest_download_url, inbound_port, 5, curl_path, verbose)
         if file_size is None:
             file_size = 1_048_576
 
         download_cmd = [
             curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-            '--max-time', str(speedtest_timeout), '--connect-timeout', str(timeout),
+            '--max-time', str(speedtest_timeout), '--connect-timeout', str(5),
             '--silent', '--output', '/dev/null', speedtest_download_url
         ]
         try:
@@ -1566,7 +1595,7 @@ def test_with_singbox(proxy: Proxy, test_url: str,
 
             upload_cmd = [
                 curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-                '--max-time', str(speedtest_timeout), '--connect-timeout', str(timeout),
+                '--max-time', str(speedtest_timeout), '--connect-timeout', str(5),
                 '--silent', '--output', '/dev/null', '--data-binary', f'@{data_file}',
                 speedtest_upload_url
             ]
@@ -1593,8 +1622,10 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                 os.unlink(data_file)
 
     # Cleanup
+    with processes_lock:
+        if proc in active_processes:
+            active_processes.remove(proc)
     proc.terminate()
-    active_processes.remove(proc)
     try:
         os.unlink(config_path)
     except:
