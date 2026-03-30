@@ -2080,7 +2080,7 @@ def main():
     parser.add_argument('--test-url', default='http://cp.cloudflare.com', help='URL to use for testing with sing-box.')
     parser.add_argument('--sing-box-path', default='/usr/bin/sing-box', help='Path to sing-box executable.')
     parser.add_argument('--test-timeout', type=float, default=5, help='Timeout in seconds for connectivity test.')
-    parser.add_argument('--test-threads', type=int, default=10, help='Number of threads for connectivity test.')
+    parser.add_argument('--test-threads', type=int, default=100, help='Number of threads for connectivity test.')
     parser.add_argument('--speedtest', action='store_true', help='Enable download and upload speed measurement (requires --test-connect).')
     parser.add_argument('--speedtest-download-url', default='http://cachefly.cachefly.net/1mb.test', help='URL for download speed test (default: http://cachefly.cachefly.net/1mb.test).')
     parser.add_argument('--speedtest-upload-url', default='https://httpbin.org/post', help='URL for upload speed test (default: https://httpbin.org/post).')
