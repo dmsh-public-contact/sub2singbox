@@ -113,9 +113,10 @@ temp/ – temporary sing-box configurations (automatically cleaned up)
 ## Notes
 
 - For --test-connect to work, sing-box must be in PATH (or specify the path with --sing-box-path).
-- OUT IP country detection uses ip-api.com (no API key, up to 45 requests/min). If the limit is exceeded, the script automatically pauses.
+- OUT IP country detection from multiply sources.
 - If the country cannot be determined for either IN IP or OUT IP, the proxy is excluded from the final list.
 - Deduplication by IP:port works after testing (when the IP is already known).
+- Extended filtering for final list.
 - All temporary files are removed when the script exits (including on Ctrl+C).
 
 ## Disclaimer
