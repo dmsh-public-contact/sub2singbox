@@ -8,7 +8,7 @@ Connectivity testing using sing-box (multi-threaded, with proper port locking), 
 Supports protocols: Hysteria, Hysteria2.
 Optional country resolution for each proxy's incoming IP (server) and outgoing IP (through proxy)
 can be used in tags and comments (format: "IN: XX OUT: YY").
-Country lookup uses iplocation.net (free, no rate limit) for IN IP and OUT IP, both via proxy.
+Country lookup uses multiple free geolocation APIs (sequentially) via proxy.
 If country lookup fails for a proxy, that proxy is automatically excluded from the final output.
 Tags can include country flags via placeholders {flag_in}, {flag_out}, {flag_pair}.
 Optional speedtest (download & upload) can be performed and results included in tags via {speed_download} and {speed_upload}.
@@ -23,6 +23,7 @@ Deduplication can be performed globally by IP and port (enabled by default) and 
 Optional country filtering: include or exclude proxies based on country codes of IN IP and OUT IP.
 If a country code is not determined (lookup failed), the proxy is automatically excluded.
 Optional speed filtering: include only proxies with download/upload speed above thresholds (--min-download-speed, --min-upload-speed).
+Optional filter: keep only proxies where incoming server IP equals outgoing IP (--same-in-out-ip).
 
 Export formats:
   - sing-box: JSON configuration with outbounds array (default).
@@ -58,7 +59,7 @@ V2ray export with IP resolution:
 
 Country resolution:
   --resolve-country: for each proxy that passes connectivity test, determine its incoming country code (server IP)
-                     and, if tested with sing-box, also the outgoing country code (exit IP) via iplocation.net.
+                     and, if tested with sing-box, also the outgoing country code (exit IP) using multiple free geolocation APIs.
                      The result is cached per IP for 24 hours and can be used in tags ({country_in}, {country_out}, {country_pair}, {flag_in}, {flag_out}, {flag_pair}) or v2ray comments.
                      If country lookup fails for a proxy (either IN or OUT, if expected), that proxy is automatically excluded from the final output.
 
@@ -82,6 +83,10 @@ Speedtest:
 Speed filtering (only applies when --speedtest is enabled):
   --min-download-speed: minimum download speed in Mbps (default: 0). Proxies with download speed below this value are excluded.
   --min-upload-speed: minimum upload speed in Mbps (default: 0). Proxies with upload speed below this value are excluded.
+
+Same IN/OUT IP filtering:
+  --same-in-out-ip: keep only proxies where the server's resolved IP (IN_IP) equals the external IP seen through the proxy (OUT_IP).
+                    Proxies for which OUT_IP could not be determined are also excluded. Requires --test-connect and --resolve-country.
 
 Deduplication:
   --no-deduplicate: disable deduplication by (host, port) within each subscription source.
@@ -1216,10 +1221,8 @@ def resolve_domain_via_proxy(domain: str, proxy_port: int, timeout: float, curl_
 def get_external_ip_via_proxy(proxy_port: int, timeout: float, curl_path: str, verbose: bool = False) -> Optional[str]:
     """Try multiple services to get external IP through proxy."""
     services = [
-        'http://ifconfig.me/ip',
-        'http://icanhazip.com',
-        'http://checkip.amazonaws.com',
-        'http://ip-api.com/fields/query'
+        'https://checkip.amazonaws.com',
+        'https://api.ipify.org'
     ]
     for url in services:
         try:
@@ -1240,6 +1243,93 @@ def get_external_ip_via_proxy(proxy_port: int, timeout: float, curl_path: str, v
     return None
 
 # ----------------------------------------------------------------------
+# Country code lookup via multiple free APIs (all through proxy)
+# ----------------------------------------------------------------------
+def get_country_code(ip: str, proxy_port: int, timeout: float, curl_path: str, verbose: bool) -> Optional[str]:
+    """
+    Try several free IP geolocation APIs sequentially via the proxy.
+    Returns the two-letter country code or None if all fail.
+    """
+    apis = [
+        # iplocation.net
+        {
+            "url": f"https://api.iplocation.net/?ip={ip}",
+            "extractor": lambda data: data.get("country_code2") if isinstance(data, dict) else None,
+            "is_json": True
+        },
+        # ip-api.com (free, no key, limited to 45 req/min)
+        {
+            "url": f"http://ip-api.com/json/{ip}?fields=countryCode",
+            "extractor": lambda data: data.get("countryCode") if isinstance(data, dict) else None,
+            "is_json": True
+        },
+        # ipapi.co (free, 1000 req/day, no key)
+        {
+            "url": f"https://ipapi.co/{ip}/json/",
+            "extractor": lambda data: data.get("country_code") if isinstance(data, dict) else None,
+            "is_json": True
+        },
+        # country.is (simple plain text)
+        {
+            "url": f"https://api.country.is/{ip}",
+            "extractor": lambda data: data.strip().upper() if isinstance(data, str) else None,
+            "is_json": False
+        },
+        # ipinfo.io (free, 50k req/month, no key but token optional)
+        {
+            "url": f"https://ipinfo.io/{ip}/json",
+            "extractor": lambda data: data.get("country") if isinstance(data, dict) else None,
+            "is_json": True
+        }
+    ]
+
+    for api in apis:
+        try:
+            cmd = [
+                curl_path, '--socks5-hostname', f'127.0.0.1:{proxy_port}',
+                '--max-time', str(timeout), '--connect-timeout', str(timeout),
+                '--silent', api["url"]
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+2)
+            if result.returncode != 0:
+                if verbose:
+                    logger.debug(f"Country API {api['url']} failed: curl error {result.returncode}")
+                continue
+
+            response = result.stdout.strip()
+            if not response:
+                continue
+
+            if api["is_json"]:
+                try:
+                    data = json.loads(response)
+                except json.JSONDecodeError:
+                    if verbose:
+                        logger.debug(f"Country API {api['url']} returned invalid JSON: {response[:100]}")
+                    continue
+                country = api["extractor"](data)
+            else:
+                country = api["extractor"](response)
+
+            if country and isinstance(country, str) and len(country) == 2:
+                if verbose:
+                    logger.debug(f"Got country {country} for IP {ip} from {api['url']}")
+                return country.upper()
+            else:
+                if verbose:
+                    logger.debug(f"Country API {api['url']} returned no valid country code (response: {response[:100]})")
+        except subprocess.TimeoutExpired:
+            if verbose:
+                logger.debug(f"Country API {api['url']} timed out")
+            continue
+        except Exception as e:
+            if verbose:
+                logger.debug(f"Country API {api['url']} exception: {e}")
+            continue
+
+    return None
+
+# ----------------------------------------------------------------------
 # Sing-box test with cache, latency, speedtest, DNS, and country (both via proxy)
 # ----------------------------------------------------------------------
 def test_with_singbox(proxy: Proxy, test_url: str,
@@ -1253,6 +1343,7 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                       cache_ttl: int,
                       ignore_cache: bool,
                       temp_dir: str,
+                      country_api_timeout: float,
                       verbose: bool = False) -> bool:
     host = proxy.original_host
     port = proxy.server_port
@@ -1381,64 +1472,16 @@ def test_with_singbox(proxy: Proxy, test_url: str,
         proxy.server = proxy.original_host
         resolved_ip = proxy.original_host
 
-    # --- 3. Country Resolution (both via proxy using iplocation.net) ---
+    # --- 3. Country Resolution (IN and OUT) using multiple APIs ---
     if resolve_country and resolved_ip:
-        # IN country via iplocation.net through proxy
-        curl_in_cmd = [
-            curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-            '--max-time', '5', '--connect-timeout', '5',
-            '--silent', f'https://api.iplocation.net/?ip={resolved_ip}'
-        ]
-        try:
-            in_result = subprocess.run(curl_in_cmd, capture_output=True, text=True, timeout=10)
-            if in_result.returncode == 0:
-                data = json.loads(in_result.stdout)
-                if data.get('response_code') == '200':
-                    country_in = data.get('country_code2')
-                    if country_in:
-                        proxy.country_in = country_in
-                        country_cache.set(resolved_ip, country_in)
-                        if verbose:
-                            logger.debug(f"IN country: {country_in} for {resolved_ip}")
-                    else:
-                        if verbose:
-                            logger.debug(f"IN country lookup returned no country_code2 for {resolved_ip}")
-                        with processes_lock:
-                            if proc in active_processes:
-                                active_processes.remove(proc)
-                        proc.terminate()
-                        try:
-                            os.unlink(config_path)
-                        except:
-                            pass
-                        return False
-                else:
-                    if verbose:
-                        logger.warning(f"IN country lookup failed for {resolved_ip}: {data.get('response_message', 'unknown error')}")
-                    with processes_lock:
-                        if proc in active_processes:
-                            active_processes.remove(proc)
-                    proc.terminate()
-                    try:
-                        os.unlink(config_path)
-                    except:
-                        pass
-                    return False
-            else:
-                if verbose:
-                    logger.warning(f"IN country lookup curl error, exit code {in_result.returncode}")
-                with processes_lock:
-                    if proc in active_processes:
-                        active_processes.remove(proc)
-                proc.terminate()
-                try:
-                    os.unlink(config_path)
-                except:
-                    pass
-                return False
-        except Exception as e:
+        # IN country
+        country_in = get_country_code(resolved_ip, inbound_port, country_api_timeout, curl_path, verbose)
+        if country_in:
+            proxy.country_in = country_in
+            country_cache.set(resolved_ip, country_in)
+        else:
             if verbose:
-                logger.warning(f"IN country lookup exception: {e}")
+                logger.debug(f"IN country lookup failed for {resolved_ip} (all APIs failed)")
             with processes_lock:
                 if proc in active_processes:
                     active_processes.remove(proc)
@@ -1449,71 +1492,26 @@ def test_with_singbox(proxy: Proxy, test_url: str,
                 pass
             return False
 
-        # OUT country: get external IP (cached if possible)
+        # OUT country: get external IP
         out_ip = get_external_ip_via_proxy(inbound_port, 5, curl_path, verbose)
         if out_ip:
             proxy.out_ip = out_ip
+            # Check cache first
             cached_out_country = country_cache.get(out_ip)
             if cached_out_country:
                 proxy.country_out = cached_out_country
                 if verbose:
                     logger.debug(f"OUT country from cache: {cached_out_country} for {out_ip}")
             else:
-                curl_country_cmd = [
-                    curl_path, '--socks5-hostname', f'127.0.0.1:{inbound_port}',
-                    '--max-time', '5', '--connect-timeout', '5',
-                    '--silent', f'https://api.iplocation.net/?ip={out_ip}'
-                ]
-                try:
-                    country_result = subprocess.run(curl_country_cmd, capture_output=True, text=True, timeout=10)
-                    if country_result.returncode == 0:
-                        data = json.loads(country_result.stdout)
-                        if data.get('response_code') == '200':
-                            country_out = data.get('country_code2')
-                            if country_out:
-                                proxy.country_out = country_out
-                                country_cache.set(out_ip, country_out)
-                                if verbose:
-                                    logger.debug(f"Outgoing country: {country_out} IP: {out_ip}")
-                            else:
-                                if verbose:
-                                    logger.debug(f"OUT country lookup returned no country_code2 for {out_ip}")
-                                with processes_lock:
-                                    if proc in active_processes:
-                                        active_processes.remove(proc)
-                                proc.terminate()
-                                try:
-                                    os.unlink(config_path)
-                                except:
-                                    pass
-                                return False
-                        else:
-                            if verbose:
-                                logger.warning(f"OUT country lookup failed for {out_ip}: {data.get('response_message', 'unknown error')}")
-                            with processes_lock:
-                                if proc in active_processes:
-                                    active_processes.remove(proc)
-                            proc.terminate()
-                            try:
-                                os.unlink(config_path)
-                            except:
-                                pass
-                            return False
-                    else:
-                        if verbose:
-                            logger.warning(f"OUT country lookup curl error, exit code {country_result.returncode}")
-                        with processes_lock:
-                            if proc in active_processes:
-                                active_processes.remove(proc)
-                        proc.terminate()
-                        try:
-                            os.unlink(config_path)
-                        except:
-                            pass
-                        return False
-                except Exception as e:
+                country_out = get_country_code(out_ip, inbound_port, country_api_timeout, curl_path, verbose)
+                if country_out:
+                    proxy.country_out = country_out
+                    country_cache.set(out_ip, country_out)
                     if verbose:
-                        logger.warning(f"OUT country lookup exception: {e}")
+                        logger.debug(f"Outgoing country: {country_out} IP: {out_ip}")
+                else:
+                    if verbose:
+                        logger.debug(f"OUT country lookup failed for {out_ip} (all APIs failed)")
                     with processes_lock:
                         if proc in active_processes:
                             active_processes.remove(proc)
@@ -1868,6 +1866,23 @@ def apply_speed_filters(proxies: List[Proxy],
     return filtered
 
 # ----------------------------------------------------------------------
+# Same IN/OUT IP filtering
+# ----------------------------------------------------------------------
+def apply_same_in_out_ip_filter(proxies: List[Proxy], verbose: bool) -> List[Proxy]:
+    filtered = []
+    for p in proxies:
+        if p.out_ip is None:
+            if verbose:
+                logger.debug(f"Filtered out by --same-in-out-ip: no OUT_IP for {p.tag}")
+            continue
+        if p.server != p.out_ip:
+            if verbose:
+                logger.debug(f"Filtered out by --same-in-out-ip: IN={p.server} OUT={p.out_ip} for {p.tag}")
+            continue
+        filtered.append(p)
+    return filtered
+
+# ----------------------------------------------------------------------
 # V2ray export
 # ----------------------------------------------------------------------
 def rebuild_uri(proxy: Proxy, new_host: str, remove_ps: bool = False) -> str:
@@ -2070,11 +2085,12 @@ def main():
     parser.add_argument('--keep-original-tags', action='store_true', help='Use the fragment part of URI (after #) as the outbound tag.')
     parser.add_argument('--tag-format', help='Custom tag format with placeholders.')
     parser.add_argument('--resolve-uris', action='store_true', help='When exporting to v2ray, replace the hostname with resolved IP.')
-    parser.add_argument('--resolve-country', action='store_true', help='Determine country codes for each working proxy via iplocation.net (requires --test-connect).')
+    parser.add_argument('--resolve-country', action='store_true', help='Determine country codes for each working proxy via multiple free geolocation APIs (requires --test-connect).')
     parser.add_argument('--include-country-in', help='Comma-separated list of country codes for IN IP (requires --test-connect and --resolve-country).')
     parser.add_argument('--exclude-country-in', help='Comma-separated list of country codes for IN IP (requires --test-connect and --resolve-country).')
     parser.add_argument('--include-country-out', help='Comma-separated list of country codes for OUT IP (requires sing-box test).')
     parser.add_argument('--exclude-country-out', help='Comma-separated list of country codes for OUT IP (requires sing-box test).')
+    parser.add_argument('--same-in-out-ip', action='store_true', help='Keep only proxies where server IP equals external IP seen through proxy (requires --test-connect and --resolve-country).')
     parser.add_argument('--no-number-tags', action='store_true', help='Disable automatic numbering of duplicate tags.')
     parser.add_argument('--test-connect', action='store_true', help='Enable connectivity test using sing-box for each outbound.')
     parser.add_argument('--test-url', default='http://cp.cloudflare.com', help='URL to use for testing with sing-box.')
@@ -2093,6 +2109,7 @@ def main():
     parser.add_argument('--create-selectors', action='store_true', help='Create default AUTO and GLOBAL selectors if no --config.')
     parser.add_argument('--no-progress', action='store_true', help='Disable progress bars (tqdm or rich).')
     parser.add_argument('--cache-dir', default=os.path.expanduser("~/.cache/sub2singbox"), help='Directory for test result cache (default: ~/.cache/sub2singbox).')
+    parser.add_argument('--country-api-timeout', type=float, default=5.0, help='Timeout in seconds for country lookup API requests (default: 5).')
 
     args, remaining = parser.parse_known_args()
 
@@ -2160,8 +2177,10 @@ def main():
     if not args.urls and not args.config:
         parser.error("At least one subscription URL or --config must be provided")
     if (args.resolve_country or args.include_country_in or args.exclude_country_in or
-        args.include_country_out or args.exclude_country_out) and not args.test_connect:
-        parser.error("--resolve-country and country filters require --test-connect (to perform sing-box testing)")
+        args.include_country_out or args.exclude_country_out or args.same_in_out_ip) and not args.test_connect:
+        parser.error("--resolve-country, country filters, and --same-in-out-ip require --test-connect (to perform sing-box testing)")
+    if args.same_in_out_ip and not args.resolve_country:
+        parser.error("--same-in-out-ip requires --resolve-country (to obtain OUT_IP)")
     if args.speedtest and not args.test_connect:
         parser.error("--speedtest requires --test-connect")
     if (args.min_download_speed is not None or args.min_upload_speed is not None) and not args.speedtest:
@@ -2302,6 +2321,7 @@ def main():
                                                 args.speedtest_upload_url, args.speedtest_timeout,
                                                 cache_ttl, args.ignore_cache,
                                                 temp_dir,
+                                                args.country_api_timeout,
                                                 verbose): p
                                for p in all_proxy_candidates}
                 for future in as_completed(future_to_p):
@@ -2357,6 +2377,11 @@ def main():
                     logger.info("Applying speed filters...")
                 all_proxy_candidates = apply_speed_filters(all_proxy_candidates, args.min_download_speed, args.min_upload_speed, verbose)
 
+            if args.same_in_out_ip:
+                if verbose:
+                    logger.info("Applying same IN/OUT IP filter...")
+                all_proxy_candidates = apply_same_in_out_ip_filter(all_proxy_candidates, verbose)
+
             if not args.no_deduplicate_ip_port:
                 unique = {}
                 for p in all_proxy_candidates:
@@ -2376,6 +2401,8 @@ def main():
                 logger.info("--resolve-country ignored because --test-connect is not enabled.")
             if args.speedtest:
                 logger.info("--speedtest ignored because --test-connect is not enabled.")
+            if args.same_in_out_ip:
+                logger.info("--same-in-out-ip ignored because --test-connect is not enabled.")
             if verbose:
                 logger.info("Skipping connectivity testing, exporting all parsed proxies.")
 
