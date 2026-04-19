@@ -9,7 +9,7 @@
     "exclude-country-in": "RU,UA,BY,KZ,CN,IR",
     "exclude-country-out": "RU,UA,BY,KZ,CN,IR",
     "country-api-timeout": 5,
-    "same-in-out-ip": false,
+    "same-in-out-ip": true,
     "test-connect": true,
     "speedtest": true,
     "min-download-speed": 1,
