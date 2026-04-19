@@ -1268,18 +1268,6 @@ def get_country_code(ip: str, proxy_port: int, timeout: float, curl_path: str, v
             "url": f"https://ipapi.co/{ip}/json/",
             "extractor": lambda data: data.get("country_code") if isinstance(data, dict) else None,
             "is_json": True
-        },
-        # country.is (simple plain text)
-        {
-            "url": f"https://api.country.is/{ip}",
-            "extractor": lambda data: data.strip().upper() if isinstance(data, str) else None,
-            "is_json": False
-        },
-        # ipinfo.io (free, 50k req/month, no key but token optional)
-        {
-            "url": f"https://ipinfo.io/{ip}/json",
-            "extractor": lambda data: data.get("country") if isinstance(data, dict) else None,
-            "is_json": True
         }
     ]
 
